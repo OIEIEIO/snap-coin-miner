@@ -136,6 +136,8 @@ fn start_block_refresh(
                     let mut d = difficulty.write().unwrap();
                     *d = calculated;
                 }
+            } else {
+                println!("[CRITICAL] Failed to fetch current block data!");
             }
             thread::sleep(Duration::from_secs(3));
         }
