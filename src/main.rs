@@ -93,7 +93,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // A task for block submissions, submitted via MPSC and a new block transmitted to all mining threads via a broadcast.
     let (submission_tx, mut submission_rx) = mpsc::channel::<Block>(1);
 
-    let (job_tx, _) = broadcast::channel::<Block>(1);
+    let (job_tx, _) = broadcast::channel::<Block>(64);
 
     let hash_counter = Arc::new(AtomicU64::new(0));
 
