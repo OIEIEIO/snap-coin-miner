@@ -8,10 +8,13 @@ use snap_coin::{
     build_block,
     core::{
         block::{Block, MAX_TRANSACTIONS_PER_BLOCK},
-        transaction::Transaction,
+        transaction::{Transaction, TransactionId},
         utils::slice_vec,
     },
-    crypto::{Hash, keys::Public},
+    crypto::{
+        Hash, address_inclusion_filter::AddressInclusionFilter, keys::Public,
+        merkle_tree::MerkleTree,
+    },
     economics::{EXPIRATION_TIME, get_block_reward},
     to_snap,
 };
@@ -27,7 +30,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{broadcast, mpsc},
+    sync::{RwLock, broadcast, mpsc},
     time::sleep,
 };
 
@@ -123,6 +126,29 @@ async fn main() -> Result<(), anyhow::Error> {
 
                     current_block.nonce = rng.random();
                     current_block.meta.hash = Some(Hash::new(&current_block.get_hashing_buf()?));
+                    let mut removed_txs = false;
+                    // 10s expiration margin
+                    current_block.transactions.retain(|tx| {
+                        let expired = tx.timestamp + EXPIRATION_TIME + 10
+                            < chrono::Utc::now().timestamp() as u64;
+                        if expired {
+                            removed_txs = true;
+                        }
+                        !expired
+                    });
+
+                    if removed_txs {
+                        current_block.meta.merkle_tree_root = MerkleTree::build(
+                            &current_block
+                                .transactions
+                                .iter()
+                                .map(|tx| tx.transaction_id.unwrap())
+                                .collect::<Vec<TransactionId>>(),
+                        )
+                        .root_hash();
+                        current_block.meta.address_inclusion_filter =
+                            AddressInclusionFilter::create_filter(&current_block.transactions)?;
+                    }
 
                     if BigUint::from_bytes_be(&current_block.meta.block_pow_difficulty)
                         > BigUint::from_bytes_be(&*current_block.meta.hash.unwrap())
@@ -162,11 +188,17 @@ async fn main() -> Result<(), anyhow::Error> {
                 Ok(mempool)
             }
 
+            let is_refreshing = Arc::new(RwLock::new(false));
             // We don't really care about what the event is because, it always requires recomputing the block
             let refresh_block = move || {
                 let client = client.clone();
                 let job_tx = job_tx.clone();
+                let is_refreshing = is_refreshing.clone();
                 tokio::spawn(async move {
+                    if *is_refreshing.read().await {
+                        return;
+                    }
+                    *is_refreshing.write().await = true;
                     if let Err(e) = async move {
                         let block =
                             build_block(&*client, &get_current_mempool(&*client).await?, miner_pub)
@@ -180,6 +212,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     {
                         println!("[JOB] Error {e}");
                     }
+                    *is_refreshing.write().await = false;
                 });
             };
 
@@ -192,7 +225,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 })
                 .await
             {
-                println!("[JOB] Error: {e}");
+                println!("[JOB] Error: {:?}", e);
             }
         })
     };
@@ -211,7 +244,7 @@ async fn main() -> Result<(), anyhow::Error> {
             }
             .await
             {
-                println!("[STATUS] Error: {e}");
+                println!("[STATUS] Error: {:?}", e);
             }
         }
     });
@@ -235,7 +268,7 @@ async fn main() -> Result<(), anyhow::Error> {
             }
             .await
             {
-                println!("[SUBMISSIONS] Error: {e}");
+                println!("[SUBMISSIONS] Error: {:?}", e);
             }
         }
     });
