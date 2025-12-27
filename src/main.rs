@@ -8,7 +8,7 @@ use snap_coin::{
     build_block,
     core::{
         block::{Block, MAX_TRANSACTIONS_PER_BLOCK},
-        transaction::{Transaction, TransactionId},
+        transaction::Transaction,
         utils::slice_vec,
     },
     crypto::{Hash, keys::Public},
@@ -44,8 +44,6 @@ fn format_hash_rate(hps: f64) -> (f64, &'static str) {
 
     (rate, UNITS[unit])
 }
-
-const BATCH_SIZE: u64 = 20;
 
 const DEFAULT_CONFIG: &str = "[node]
 address = \"127.0.0.1:3003\"
@@ -90,6 +88,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let miner_pub = Public::new_from_base36(&public_key_base36).expect("Invalid public key");
     let client = Arc::new(Client::connect(node_address.parse().unwrap()).await?);
+    let event_client = Client::connect(node_address.parse().unwrap()).await?;
 
     // A task for block submissions, submitted via MPSC and a new block transmitted to all mining threads via a broadcast.
     let (submission_tx, mut submission_rx) = mpsc::channel::<Block>(1);
@@ -122,23 +121,19 @@ async fn main() -> Result<(), anyhow::Error> {
                     }
                     current_block.timestamp = chrono::Utc::now().timestamp() as u64;
 
-                    for _ in 0..BATCH_SIZE {
-                        current_block.nonce = rng.random();
-                        current_block.meta.hash =
-                            Some(Hash::new(&current_block.get_hashing_buf()?));
+                    current_block.nonce = rng.random();
+                    current_block.meta.hash = Some(Hash::new(&current_block.get_hashing_buf()?));
 
-                        if BigUint::from_bytes_be(&current_block.meta.block_pow_difficulty)
-                            > BigUint::from_bytes_be(&*current_block.meta.hash.unwrap())
-                        {
-                            println!(
-                                "[THREAD {i}] Found block {}",
-                                current_block.meta.hash.unwrap().dump_base36()
-                            );
-                            submission_tx.blocking_send(current_block.clone())?;
-                            break;
-                        }
+                    if BigUint::from_bytes_be(&current_block.meta.block_pow_difficulty)
+                        > BigUint::from_bytes_be(&*current_block.meta.hash.unwrap())
+                    {
+                        println!(
+                            "[THREAD {i}] Found block {}",
+                            current_block.meta.hash.unwrap().dump_base36()
+                        );
+                        submission_tx.blocking_send(current_block.clone())?;
                     }
-                    hash_counter.fetch_add(BATCH_SIZE, Ordering::Relaxed);
+                    hash_counter.fetch_add(1, Ordering::Relaxed);
 
                     Ok::<(), anyhow::Error>(())
                 })() {
@@ -150,16 +145,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let _job_task = {
         let client = client.clone();
-        tokio::spawn(async move {
-            async fn get_diffs(
-                client: &Client,
-            ) -> Result<([u8; 32], [u8; 32]), BlockchainDataProviderError> {
-                Ok((
-                    client.get_block_difficulty().await?,
-                    client.get_transaction_difficulty().await?,
-                ))
-            }
 
+        tokio::spawn(async move {
             async fn get_current_mempool(
                 client: &Client,
             ) -> Result<Vec<Transaction>, BlockchainDataProviderError> {
@@ -170,49 +157,64 @@ async fn main() -> Result<(), anyhow::Error> {
                 )
                 .to_vec();
                 mempool.retain(|tx| {
-                    tx.timestamp + 3 + 5 < EXPIRATION_TIME + chrono::Utc::now().timestamp() as u64
-                }); // Add a 10s anti expiration buffer
+                    tx.timestamp + 5 < EXPIRATION_TIME + chrono::Utc::now().timestamp() as u64
+                }); // Add a 5s anti expiration buffer
                 Ok(mempool)
             }
 
-            let mut last_block_diffs = ([0u8; 32], [0u8; 32]);
-            let mut last_mempool: Vec<Transaction> = vec![];
-            loop {
-                if let Err(e) = async {
-                    let last = chrono::Utc::now().timestamp_millis() as f64;
-                    sleep(Duration::from_secs(3)).await;
-                    let current_block_diffs = get_diffs(&*client).await?;
-                    let current_mempool = get_current_mempool(&*client).await?;
+            // We don't really care about what the event is because, it always requires recomputing the block
+            let refresh_block = move || {
+                let client = client.clone();
+                let job_tx = job_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = async move {
+                        let block =
+                            build_block(&*client, &get_current_mempool(&*client).await?, miner_pub)
+                                .await?;
 
-                    if last_block_diffs != current_block_diffs
-                        || current_mempool
-                            .iter()
-                            .map(|tx| tx.transaction_id)
-                            .collect::<Vec<Option<TransactionId>>>()
-                            != last_mempool
-                                .iter()
-                                .map(|tx| tx.transaction_id)
-                                .collect::<Vec<Option<TransactionId>>>()
-                    {
-                        last_block_diffs = current_block_diffs;
-                        last_mempool = current_mempool.clone();
-                        let block = build_block(&*client, &current_mempool, miner_pub).await?;
                         job_tx.send(block)?;
+
+                        Ok::<(), anyhow::Error>(())
                     }
-                    let hashes = hash_counter.swap(0, Ordering::Relaxed) as f64;
-                    let delta = chrono::Utc::now().timestamp_millis() as f64 - last;
-                    let (display_rate, units) = format_hash_rate((hashes / delta) * 1000f64);
-                    println!("[STATUS] Hash rate: {} {}", display_rate, units);
-                    Ok::<(), anyhow::Error>(())
-                }
+                    .await
+                    {
+                        println!("[JOB] Error {e}");
+                    }
+                });
+            };
+
+            // Initial block refresh
+            refresh_block();
+
+            if let Err(e) = event_client
+                .convert_to_event_listener(|_event| {
+                    refresh_block();
+                })
                 .await
-                {
-                    println!("[JOB] Error: {e}");
-                }
+            {
+                println!("[JOB] Error: {e}");
             }
         })
     };
 
+    let _hash_rate_task = tokio::spawn(async move {
+        loop {
+            if let Err(e) = async {
+                let last = chrono::Utc::now().timestamp_millis() as f64;
+                sleep(Duration::from_secs(3)).await;
+
+                let hashes = hash_counter.swap(0, Ordering::Relaxed) as f64;
+                let delta = chrono::Utc::now().timestamp_millis() as f64 - last;
+                let (display_rate, units) = format_hash_rate((hashes / delta) * 1000f64);
+                println!("[STATUS] Hash rate: {} {}", display_rate, units);
+                Ok::<(), anyhow::Error>(())
+            }
+            .await
+            {
+                println!("[STATUS] Error: {e}");
+            }
+        }
+    });
     let submission_task = tokio::spawn(async move {
         loop {
             if let Err(e) = async {
