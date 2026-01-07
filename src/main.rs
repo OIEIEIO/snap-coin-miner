@@ -13,21 +13,16 @@ use snap_coin::{
     },
     crypto::{
         Hash, address_inclusion_filter::AddressInclusionFilter, keys::Public,
-        merkle_tree::MerkleTree,
+        merkle_tree::MerkleTree, randomx_use_full_mode,
     },
-    economics::{EXPIRATION_TIME, get_block_reward},
+    economics::{EXPIRATION_TIME, calculate_dev_fee, get_block_reward},
     to_snap,
 };
 use std::{
-    env::args,
-    fs::{self, File},
-    io::Write,
-    sync::{
+    env::args, fs::{self, File}, io::Write, sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
-    },
-    thread,
-    time::Duration,
+    }, thread, time::Duration
 };
 use tokio::{
     sync::{RwLock, broadcast, mpsc},
@@ -59,6 +54,7 @@ count = 1";
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
+    randomx_use_full_mode();
     let mut config_path = "./miner.toml";
 
     let args: Vec<String> = args().into_iter().collect();
@@ -90,8 +86,9 @@ async fn main() -> Result<(), anyhow::Error> {
     };
 
     let miner_pub = Public::new_from_base36(&public_key_base36).expect("Invalid public key");
-    let client = Arc::new(Client::connect(node_address.parse().unwrap()).await?);
+    let submission_client = Arc::new(Client::connect(node_address.parse().unwrap()).await?);
     let event_client = Client::connect(node_address.parse().unwrap()).await?;
+    let job_client = Arc::new(Client::connect(node_address.parse().unwrap()).await?);
 
     // A task for block submissions, submitted via MPSC and a new block transmitted to all mining threads via a broadcast.
     let (submission_tx, mut submission_rx) = mpsc::channel::<Block>(1);
@@ -100,12 +97,15 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let hash_counter = Arc::new(AtomicU64::new(0));
 
+    let global_job_id = Arc::new(AtomicU64::new(0));
+
     // Create mining threads
     for i in 0..thread_count {
-        println!("[THREAD {i}] Starting miner");
+        println!("[THREAD {}] Starting miner", i + 1);
         let mut job_rx = job_tx.subscribe();
         let submission_tx = submission_tx.clone();
         let hash_counter = hash_counter.clone();
+        let global_job_id = global_job_id.clone();
         thread::spawn(move || {
             // At startup wait for block thread to create a block
             let mut current_block = loop {
@@ -117,10 +117,15 @@ async fn main() -> Result<(), anyhow::Error> {
             };
 
             let mut rng = rng();
+            let mut local_job_id = 0;
             loop {
                 if let Err(e) = (|| {
-                    if !job_rx.is_empty() {
-                        current_block = job_rx.blocking_recv()?;
+                    while global_job_id.load(Ordering::Relaxed) > local_job_id {
+                        if let Ok(job) = job_rx.try_recv() {
+                            local_job_id += 1;
+                            current_block = job;
+                        }
+                        thread::sleep(Duration::from_millis(10));
                     }
                     current_block.timestamp = chrono::Utc::now().timestamp() as u64;
 
@@ -151,7 +156,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     }
 
                     if BigUint::from_bytes_be(&current_block.meta.block_pow_difficulty)
-                        > BigUint::from_bytes_be(&*current_block.meta.hash.unwrap())
+                        > BigUint::from_bytes_be(&*current_block.meta.hash.unwrap()) && global_job_id.load(Ordering::Relaxed) == local_job_id
                     {
                         println!(
                             "[THREAD {i}] Found block {}",
@@ -170,8 +175,6 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     let _job_task = {
-        let client = client.clone();
-
         tokio::spawn(async move {
             async fn get_current_mempool(
                 client: &Client,
@@ -191,9 +194,9 @@ async fn main() -> Result<(), anyhow::Error> {
             let is_refreshing = Arc::new(RwLock::new(false));
             // We don't really care about what the event is because, it always requires recomputing the block
             let refresh_block = move || {
-                let client = client.clone();
+                let client = job_client.clone();
                 let job_tx = job_tx.clone();
-                let is_refreshing = is_refreshing.clone();
+                let is_refreshing: Arc<RwLock<bool>> = is_refreshing.clone();
                 tokio::spawn(async move {
                     if *is_refreshing.read().await {
                         return;
@@ -253,12 +256,13 @@ async fn main() -> Result<(), anyhow::Error> {
             if let Err(e) = async {
                 let candidate = submission_rx.recv().await;
                 if let Some(candidate) = candidate {
-                    client.submit_block(candidate).await??;
+                    global_job_id.fetch_add(1, Ordering::Relaxed);
+                    submission_client.submit_block(candidate).await??;
+                    let block_reward =
+                        get_block_reward(submission_client.get_height().await?.saturating_sub(1));
                     println!(
                         "[SUBMISSIONS] Block validated! Miner rewarded {} SNAP",
-                        to_snap(get_block_reward(
-                            client.get_height().await?.saturating_sub(1)
-                        ))
+                        to_snap(block_reward - calculate_dev_fee(block_reward))
                     );
                 } else {
                     eprint!("[SUBMISSIONS] All miner threads died!");
@@ -268,6 +272,7 @@ async fn main() -> Result<(), anyhow::Error> {
             }
             .await
             {
+                global_job_id.fetch_sub(1, Ordering::Relaxed);
                 println!("[SUBMISSIONS] Error: {:?}", e);
             }
         }
