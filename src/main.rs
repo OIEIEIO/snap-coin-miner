@@ -19,10 +19,15 @@ use snap_coin::{
     to_snap,
 };
 use std::{
-    env::args, fs::{self, File}, io::Write, sync::{
+    env::args,
+    fs::{self, File},
+    io::Write,
+    sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
-    }, thread, time::Duration
+    },
+    thread,
+    time::Duration,
 };
 use tokio::{
     sync::{RwLock, broadcast, mpsc},
@@ -54,14 +59,20 @@ count = 1";
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    randomx_use_full_mode();
     let mut config_path = "./miner.toml";
 
     let args: Vec<String> = args().into_iter().collect();
+    let mut full_dataset = true;
     for (place, arg) in args.iter().enumerate() {
         if arg == "--config" && args.get(place + 1).is_some() {
             config_path = &args[place + 1];
         }
+        if arg == "--no-dataset" {
+            full_dataset = false;
+        }
+    }
+    if full_dataset {
+        randomx_use_full_mode();
     }
 
     if !fs::exists(config_path).is_ok_and(|exists| exists == true) {
@@ -107,33 +118,47 @@ async fn main() -> Result<(), anyhow::Error> {
         let hash_counter = hash_counter.clone();
         let global_job_id = global_job_id.clone();
         thread::spawn(move || {
-            // At startup wait for block thread to create a block
-            let mut current_block = loop {
-                match job_rx.blocking_recv() {
-                    Ok(v) => break v,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return,
-                }
-            };
-
             let mut rng = rng();
             let mut local_job_id = 0;
+            let mut current_block: Option<Block> = None;
+            
             loop {
                 if let Err(e) = (|| {
-                    while global_job_id.load(Ordering::Relaxed) > local_job_id {
-                        if let Ok(job) = job_rx.try_recv() {
-                            local_job_id += 1;
-                            current_block = job;
+                    // Check for new jobs and wait until we're synchronized
+                    let current_global_job = global_job_id.load(Ordering::Relaxed);
+                    
+                    // If we don't have a block yet or we're behind, wait for new job
+                    while current_block.is_none() || current_global_job > local_job_id {
+                        match job_rx.blocking_recv() {
+                            Ok(job) => {
+                                local_job_id += 1;
+                                current_block = Some(job);
+                                break;
+                            }
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                println!("[THREAD {i}] Warning: Lagged by {skipped} jobs, catching up...");
+                                continue;
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                return Err(anyhow!("Job channel closed"));
+                            }
                         }
-                        thread::sleep(Duration::from_millis(10));
                     }
-                    current_block.timestamp = chrono::Utc::now().timestamp() as u64;
 
-                    current_block.nonce = rng.random();
-                    current_block.meta.hash = Some(Hash::new(&current_block.get_hashing_buf()?));
+                    // Only mine if we're synchronized with the global job ID
+                    if global_job_id.load(Ordering::Relaxed) != local_job_id {
+                        thread::sleep(Duration::from_millis(10));
+                        return Ok(());
+                    }
+
+                    let block = current_block.as_mut().unwrap();
+                    block.timestamp = chrono::Utc::now().timestamp() as u64;
+
+                    block.nonce = rng.random();
+                    block.meta.hash = Some(Hash::new(&block.get_hashing_buf()?));
                     let mut removed_txs = false;
                     // 10s expiration margin
-                    current_block.transactions.retain(|tx| {
+                    block.transactions.retain(|tx| {
                         let expired = tx.timestamp + EXPIRATION_TIME + 10
                             < chrono::Utc::now().timestamp() as u64;
                         if expired {
@@ -143,26 +168,27 @@ async fn main() -> Result<(), anyhow::Error> {
                     });
 
                     if removed_txs {
-                        current_block.meta.merkle_tree_root = MerkleTree::build(
-                            &current_block
+                        block.meta.merkle_tree_root = MerkleTree::build(
+                            &block
                                 .transactions
                                 .iter()
                                 .map(|tx| tx.transaction_id.unwrap())
                                 .collect::<Vec<TransactionId>>(),
                         )
                         .root_hash();
-                        current_block.meta.address_inclusion_filter =
-                            AddressInclusionFilter::create_filter(&current_block.transactions)?;
+                        block.meta.address_inclusion_filter =
+                            AddressInclusionFilter::create_filter(&block.transactions)?;
                     }
 
-                    if BigUint::from_bytes_be(&current_block.meta.block_pow_difficulty)
-                        > BigUint::from_bytes_be(&*current_block.meta.hash.unwrap()) && global_job_id.load(Ordering::Relaxed) == local_job_id
+                    if BigUint::from_bytes_be(&block.meta.block_pow_difficulty)
+                        > BigUint::from_bytes_be(&*block.meta.hash.unwrap())
+                        && global_job_id.load(Ordering::Relaxed) == local_job_id
                     {
                         println!(
                             "[THREAD {i}] Found block {}",
-                            current_block.meta.hash.unwrap().dump_base36()
+                            block.meta.hash.unwrap().dump_base36()
                         );
-                        submission_tx.blocking_send(current_block.clone())?;
+                        submission_tx.blocking_send(block.clone())?;
                     }
                     hash_counter.fetch_add(1, Ordering::Relaxed);
 
@@ -174,6 +200,10 @@ async fn main() -> Result<(), anyhow::Error> {
         });
     }
 
+    // Give threads time to subscribe before starting job refresh
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let global_job_id_for_refresh = global_job_id.clone();
     let _job_task = {
         tokio::spawn(async move {
             async fn get_current_mempool(
@@ -197,6 +227,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 let client = job_client.clone();
                 let job_tx = job_tx.clone();
                 let is_refreshing: Arc<RwLock<bool>> = is_refreshing.clone();
+                let global_job_id = global_job_id_for_refresh.clone();
                 tokio::spawn(async move {
                     if *is_refreshing.read().await {
                         return;
@@ -207,6 +238,10 @@ async fn main() -> Result<(), anyhow::Error> {
                             build_block(&*client, &get_current_mempool(&*client).await?, miner_pub)
                                 .await?;
 
+                        // Increment global job ID BEFORE sending the new job
+                        let new_job_id = global_job_id.fetch_add(1, Ordering::Relaxed) + 1;
+                        println!("[JOB] Received new job (ID: {new_job_id})");
+                        
                         job_tx.send(block)?;
 
                         Ok::<(), anyhow::Error>(())
@@ -251,12 +286,14 @@ async fn main() -> Result<(), anyhow::Error> {
             }
         }
     });
+    
     let submission_task = tokio::spawn(async move {
         loop {
             if let Err(e) = async {
                 let candidate = submission_rx.recv().await;
                 if let Some(candidate) = candidate {
-                    global_job_id.fetch_add(1, Ordering::Relaxed);
+                    // Don't increment global_job_id here - it's already incremented by refresh_block
+                    // which gets called when the block is accepted
                     submission_client.submit_block(candidate).await??;
                     let block_reward =
                         get_block_reward(submission_client.get_height().await?.saturating_sub(1));
@@ -272,7 +309,6 @@ async fn main() -> Result<(), anyhow::Error> {
             }
             .await
             {
-                global_job_id.fetch_sub(1, Ordering::Relaxed);
                 println!("[SUBMISSIONS] Error: {:?}", e);
             }
         }
