@@ -30,6 +30,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     sync::{RwLock, broadcast, mpsc},
     time::sleep,
 };
@@ -48,6 +49,43 @@ fn format_hash_rate(hps: f64) -> (f64, &'static str) {
     (rate, UNITS[unit])
 }
 
+pub fn normalize_difficulty(target: &[u8; 32]) -> f64 {
+    // find first non-zero byte
+    let mut i = 0;
+    while i < 32 && target[i] == 0 {
+        i += 1;
+    }
+
+    if i == 32 {
+        return f64::INFINITY;
+    }
+
+    // read top 8 bytes for mantissa
+    let mut buf = [0u8; 8];
+    let len = (32 - i).min(8);
+    buf[..len].copy_from_slice(&target[i..i + len]);
+
+    let mantissa = u64::from_be_bytes(buf) as f64;
+
+    // exponent in bits
+    let exp = ((32 - i) * 8) as i32;
+
+    // max target is all 0xff
+    let max_mantissa = u64::MAX as f64;
+    let max_exp = 256i32;
+
+    let target_f = mantissa * 2f64.powi(exp - 64);
+    let max_f = max_mantissa * 2f64.powi(max_exp - 64);
+
+    max_f / target_f
+}
+
+#[derive(Copy, Clone, Debug)]
+struct PoolInfo {
+    pool_difficulty: [u8; 32],
+    pool_address: Public,
+}
+
 const DEFAULT_CONFIG: &str = "[node]
 address = \"127.0.0.1:3003\"
 
@@ -57,18 +95,37 @@ public = \"<your public wallet address>\"
 [threads]
 count = 1";
 
+async fn init_client_pool(client: &Client, miner: Public) -> Result<PoolInfo, anyhow::Error> {
+    let mut client = client.stream.lock().await;
+    let mut pool_difficulty = [0u8; 32];
+    let mut pool_address = [0u8; 32];
+    client.write_all(miner.dump_buf()).await?;
+    client.read_exact(&mut pool_difficulty).await?;
+    client.read_exact(&mut pool_address).await?;
+    let pool_address = Public::new_from_buf(&pool_address);
+
+    Ok(PoolInfo {
+        pool_address,
+        pool_difficulty,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let mut config_path = "./miner.toml";
 
     let args: Vec<String> = args().into_iter().collect();
     let mut full_dataset = true;
+    let mut is_pool = false;
     for (place, arg) in args.iter().enumerate() {
         if arg == "--config" && args.get(place + 1).is_some() {
             config_path = &args[place + 1];
         }
         if arg == "--no-dataset" {
             full_dataset = false;
+        }
+        if arg == "--pool" {
+            is_pool = true;
         }
     }
     if full_dataset {
@@ -101,6 +158,20 @@ async fn main() -> Result<(), anyhow::Error> {
     let event_client = Client::connect(node_address.parse().unwrap()).await?;
     let job_client = Arc::new(Client::connect(node_address.parse().unwrap()).await?);
 
+    let pool_info = if is_pool {
+        init_client_pool(&*submission_client, miner_pub).await?;
+        init_client_pool(&event_client, miner_pub).await?;
+        let pool_info = init_client_pool(&*job_client, miner_pub).await?;
+        println!(
+            "Pool INFO:\nAddress: {}\nDifficulty: {}",
+            pool_info.pool_address.dump_base36(),
+            normalize_difficulty(&pool_info.pool_difficulty)
+        );
+        Some(pool_info)
+    } else {
+        None
+    };
+
     // A task for block submissions, submitted via MPSC and a new block transmitted to all mining threads via a broadcast.
     let (submission_tx, mut submission_rx) = mpsc::channel::<Block>(1);
 
@@ -121,12 +192,12 @@ async fn main() -> Result<(), anyhow::Error> {
             let mut rng = rng();
             let mut local_job_id = 0;
             let mut current_block: Option<Block> = None;
-            
+
             loop {
                 if let Err(e) = (|| {
                     // Check for new jobs and wait until we're synchronized
                     let current_global_job = global_job_id.load(Ordering::Relaxed);
-                    
+
                     // If we don't have a block yet or we're behind, wait for new job
                     while current_block.is_none() || current_global_job > local_job_id {
                         match job_rx.blocking_recv() {
@@ -136,7 +207,9 @@ async fn main() -> Result<(), anyhow::Error> {
                                 break;
                             }
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                                println!("[THREAD {i}] Warning: Lagged by {skipped} jobs, catching up...");
+                                println!(
+                                    "[THREAD {i}] Warning: Lagged by {skipped} jobs, catching up..."
+                                );
                                 continue;
                             }
                             Err(broadcast::error::RecvError::Closed) => {
@@ -179,17 +252,30 @@ async fn main() -> Result<(), anyhow::Error> {
                         block.meta.address_inclusion_filter =
                             AddressInclusionFilter::create_filter(&block.transactions)?;
                     }
-
-                    if BigUint::from_bytes_be(&block.meta.block_pow_difficulty)
-                        > BigUint::from_bytes_be(&*block.meta.hash.unwrap())
-                        && global_job_id.load(Ordering::Relaxed) == local_job_id
-                    {
-                        println!(
-                            "[THREAD {i}] Found block {}",
-                            block.meta.hash.unwrap().dump_base36()
-                        );
-                        submission_tx.blocking_send(block.clone())?;
+                    if is_pool {
+                        if BigUint::from_bytes_be(&pool_info.unwrap().pool_difficulty)
+                            > BigUint::from_bytes_be(&*block.meta.hash.unwrap())
+                            && global_job_id.load(Ordering::Relaxed) == local_job_id
+                        {
+                            println!(
+                                "[THREAD {i}] Found share {}",
+                                block.meta.hash.unwrap().dump_base36()
+                            );
+                            submission_tx.blocking_send(block.clone())?;
+                        }
+                    } else {
+                        if BigUint::from_bytes_be(&block.meta.block_pow_difficulty)
+                            > BigUint::from_bytes_be(&*block.meta.hash.unwrap())
+                            && global_job_id.load(Ordering::Relaxed) == local_job_id
+                        {
+                            println!(
+                                "[THREAD {i}] Found block {}",
+                                block.meta.hash.unwrap().dump_base36()
+                            );
+                            submission_tx.blocking_send(block.clone())?;
+                        }
                     }
+
                     hash_counter.fetch_add(1, Ordering::Relaxed);
 
                     Ok::<(), anyhow::Error>(())
@@ -234,14 +320,21 @@ async fn main() -> Result<(), anyhow::Error> {
                     }
                     *is_refreshing.write().await = true;
                     if let Err(e) = async move {
-                        let block =
-                            build_block(&*client, &get_current_mempool(&*client).await?, miner_pub)
-                                .await?;
+                        let block = build_block(
+                            &*client,
+                            &get_current_mempool(&*client).await?,
+                            if is_pool {
+                                pool_info.unwrap().pool_address
+                            } else {
+                                miner_pub
+                            },
+                        )
+                        .await?;
 
                         // Increment global job ID BEFORE sending the new job
                         let new_job_id = global_job_id.fetch_add(1, Ordering::Relaxed) + 1;
                         println!("[JOB] Received new job (ID: {new_job_id})");
-                        
+
                         job_tx.send(block)?;
 
                         Ok::<(), anyhow::Error>(())
@@ -286,7 +379,7 @@ async fn main() -> Result<(), anyhow::Error> {
             }
         }
     });
-    
+
     let submission_task = tokio::spawn(async move {
         loop {
             if let Err(e) = async {
@@ -297,10 +390,14 @@ async fn main() -> Result<(), anyhow::Error> {
                     submission_client.submit_block(candidate).await??;
                     let block_reward =
                         get_block_reward(submission_client.get_height().await?.saturating_sub(1));
-                    println!(
-                        "[SUBMISSIONS] Block validated! Miner rewarded {} SNAP",
-                        to_snap(block_reward - calculate_dev_fee(block_reward))
-                    );
+                    if !is_pool {
+                        println!(
+                            "[SUBMISSIONS] Block validated! Miner rewarded {} SNAP",
+                            to_snap(block_reward - calculate_dev_fee(block_reward))
+                        );
+                    } else {
+                        println!("[SUBMISSIONS] Share validated! Miner awarded share");
+                    }
                 } else {
                     eprint!("[SUBMISSIONS] All miner threads died!");
                 }
