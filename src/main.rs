@@ -16,12 +16,14 @@ use snap_coin::{
         merkle_tree::MerkleTree, randomx_use_full_mode,
     },
     economics::{EXPIRATION_TIME, calculate_dev_fee, get_block_reward},
+    full_node::node_state::ChainEvent,
     to_snap,
 };
 use std::{
     env::args,
     fs::{self, File},
     io::Write,
+    process::exit,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -83,7 +85,6 @@ pub fn normalize_difficulty(target: &[u8; 32]) -> f64 {
 #[derive(Copy, Clone, Debug)]
 struct PoolInfo {
     pool_difficulty: [u8; 32],
-    pool_address: Public,
 }
 
 const DEFAULT_CONFIG: &str = "[node]
@@ -98,16 +99,10 @@ count = 1";
 async fn init_client_pool(client: &Client, miner: Public) -> Result<PoolInfo, anyhow::Error> {
     let mut client = client.stream.lock().await;
     let mut pool_difficulty = [0u8; 32];
-    let mut pool_address = [0u8; 32];
     client.write_all(miner.dump_buf()).await?;
     client.read_exact(&mut pool_difficulty).await?;
-    client.read_exact(&mut pool_address).await?;
-    let pool_address = Public::new_from_buf(&pool_address);
 
-    Ok(PoolInfo {
-        pool_address,
-        pool_difficulty,
-    })
+    Ok(PoolInfo { pool_difficulty })
 }
 
 #[tokio::main]
@@ -163,8 +158,7 @@ async fn main() -> Result<(), anyhow::Error> {
         init_client_pool(&event_client, miner_pub).await?;
         let pool_info = init_client_pool(&*job_client, miner_pub).await?;
         println!(
-            "Pool INFO:\nAddress: {}\nDifficulty: {}",
-            pool_info.pool_address.dump_base36(),
+            "Pool INFO:\nDifficulty: {}",
             normalize_difficulty(&pool_info.pool_difficulty)
         );
         Some(pool_info)
@@ -227,8 +221,6 @@ async fn main() -> Result<(), anyhow::Error> {
                     let block = current_block.as_mut().unwrap();
                     block.timestamp = chrono::Utc::now().timestamp() as u64;
 
-                    block.nonce = rng.random();
-                    block.meta.hash = Some(Hash::new(&block.get_hashing_buf()?));
                     let mut removed_txs = false;
                     // 10s expiration margin
                     block.transactions.retain(|tx| {
@@ -252,6 +244,10 @@ async fn main() -> Result<(), anyhow::Error> {
                         block.meta.address_inclusion_filter =
                             AddressInclusionFilter::create_filter(&block.transactions)?;
                     }
+
+                    block.nonce = rng.random();
+                    block.meta.hash = Some(Hash::new(&block.get_hashing_buf()?));
+
                     if is_pool {
                         if BigUint::from_bytes_be(&pool_info.unwrap().pool_difficulty)
                             > BigUint::from_bytes_be(&*block.meta.hash.unwrap())
@@ -309,7 +305,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
             let is_refreshing = Arc::new(RwLock::new(false));
             // We don't really care about what the event is because, it always requires recomputing the block
-            let refresh_block = move || {
+            let refresh_block = move |event: Option<ChainEvent>| {
                 let client = job_client.clone();
                 let job_tx = job_tx.clone();
                 let is_refreshing: Arc<RwLock<bool>> = is_refreshing.clone();
@@ -318,18 +314,23 @@ async fn main() -> Result<(), anyhow::Error> {
                     if *is_refreshing.read().await {
                         return;
                     }
+
                     *is_refreshing.write().await = true;
                     if let Err(e) = async move {
-                        let block = build_block(
-                            &*client,
-                            &get_current_mempool(&*client).await?,
-                            if is_pool {
-                                pool_info.unwrap().pool_address
-                            } else {
-                                miner_pub
-                            },
-                        )
-                        .await?;
+                        if is_pool {
+                            if let Some(event) = event
+                                && let ChainEvent::Block { block: job } = event
+                            {
+                                let new_job_id = global_job_id.fetch_add(1, Ordering::Relaxed) + 1;
+                                println!("[JOB] Received new job (ID: {new_job_id})");
+                                job_tx.send(job)?;
+                            }
+                            return Ok(());
+                        }
+
+                        let block =
+                            build_block(&*client, &get_current_mempool(&*client).await?, miner_pub)
+                                .await?;
 
                         // Increment global job ID BEFORE sending the new job
                         let new_job_id = global_job_id.fetch_add(1, Ordering::Relaxed) + 1;
@@ -342,21 +343,25 @@ async fn main() -> Result<(), anyhow::Error> {
                     .await
                     {
                         println!("[JOB] Error {e}");
+                        exit(1);
                     }
                     *is_refreshing.write().await = false;
                 });
             };
 
             // Initial block refresh
-            refresh_block();
+            if !is_pool {
+                refresh_block(None)
+            };
 
             if let Err(e) = event_client
-                .convert_to_event_listener(|_event| {
-                    refresh_block();
+                .convert_to_event_listener(|event| {
+                    refresh_block(Some(event));
                 })
                 .await
             {
                 println!("[JOB] Error: {:?}", e);
+                exit(2);
             }
         })
     };
@@ -388,9 +393,10 @@ async fn main() -> Result<(), anyhow::Error> {
                     // Don't increment global_job_id here - it's already incremented by refresh_block
                     // which gets called when the block is accepted
                     submission_client.submit_block(candidate).await??;
-                    let block_reward =
-                        get_block_reward(submission_client.get_height().await?.saturating_sub(1));
                     if !is_pool {
+                        let block_reward = get_block_reward(
+                            submission_client.get_height().await?.saturating_sub(1),
+                        );
                         println!(
                             "[SUBMISSIONS] Block validated! Miner rewarded {} SNAP",
                             to_snap(block_reward - calculate_dev_fee(block_reward))
