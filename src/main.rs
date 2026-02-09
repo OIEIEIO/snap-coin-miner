@@ -1,117 +1,50 @@
 use anyhow::anyhow;
 use config::Config;
-use num_bigint::BigUint;
-use rand::{Rng, rng};
 use snap_coin::{
     api::client::Client,
-    blockchain_data_provider::{BlockchainDataProvider, BlockchainDataProviderError},
-    build_block,
-    core::{
-        block::{Block, MAX_TRANSACTIONS_PER_BLOCK},
-        transaction::{Transaction, TransactionId},
-        utils::slice_vec,
-    },
-    crypto::{
-        Hash, address_inclusion_filter::AddressInclusionFilter, keys::Public,
-        merkle_tree::MerkleTree, randomx_use_full_mode,
-    },
-    economics::{EXPIRATION_TIME, calculate_dev_fee, get_block_reward},
-    full_node::node_state::ChainEvent,
-    to_snap,
+    blockchain_data_provider::BlockchainDataProvider,
+    crypto::{Hash, keys::Public, randomx_use_full_mode},
 };
 use std::{
     env::args,
     fs::{self, File},
     io::Write,
-    process::exit,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    net::SocketAddr,
+    sync::{Arc, atomic::AtomicU64},
     thread,
     time::Duration,
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::{RwLock, broadcast, mpsc},
-    time::sleep,
-};
+use tokio::sync::{broadcast, mpsc};
 
-fn format_hash_rate(hps: f64) -> (f64, &'static str) {
-    const UNITS: [&str; 5] = ["H/s", "kH/s", "MH/s", "GH/s", "TH/s"];
+mod jobs;
+mod mining;
+mod pool;
+mod stats;
+mod tui;
+mod utils;
 
-    let mut rate = hps;
-    let mut unit = 0;
-
-    while rate >= 1000.0 && unit < UNITS.len() - 1 {
-        rate /= 1000.0;
-        unit += 1;
-    }
-
-    (rate, UNITS[unit])
-}
-
-pub fn normalize_difficulty(target: &[u8; 32]) -> f64 {
-    // find first non-zero byte
-    let mut i = 0;
-    while i < 32 && target[i] == 0 {
-        i += 1;
-    }
-
-    if i == 32 {
-        return f64::INFINITY;
-    }
-
-    // read top 8 bytes for mantissa
-    let mut buf = [0u8; 8];
-    let len = (32 - i).min(8);
-    buf[..len].copy_from_slice(&target[i..i + len]);
-
-    let mantissa = u64::from_be_bytes(buf) as f64;
-
-    // exponent in bits
-    let exp = ((32 - i) * 8) as i32;
-
-    // max target is all 0xff
-    let max_mantissa = u64::MAX as f64;
-    let max_exp = 256i32;
-
-    let target_f = mantissa * 2f64.powi(exp - 64);
-    let max_f = max_mantissa * 2f64.powi(max_exp - 64);
-
-    max_f / target_f
-}
-
-#[derive(Copy, Clone, Debug)]
-struct PoolInfo {
-    pool_difficulty: [u8; 32],
-}
+use jobs::JobManager;
+use mining::MiningThread;
+use stats::{MinerStats, StatEvent};
+use tui::TuiManager;
 
 const DEFAULT_CONFIG: &str = "[node]
-address = \"127.0.0.1:3003\"
+address = \"<node address or pool address>\"
 
 [miner]
 public = \"<your public wallet address>\"
 
 [threads]
-count = 1";
-
-async fn init_client_pool(client: &Client, miner: Public) -> Result<PoolInfo, anyhow::Error> {
-    let mut client = client.stream.lock().await;
-    let mut pool_difficulty = [0u8; 32];
-    client.write_all(miner.dump_buf()).await?;
-    client.read_exact(&mut pool_difficulty).await?;
-
-    Ok(PoolInfo { pool_difficulty })
-}
+count = -1";
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let mut config_path = "./miner.toml";
-
     let args: Vec<String> = args().into_iter().collect();
     let mut full_dataset = true;
     let mut is_pool = false;
+
+    // Parse command line arguments
     for (place, arg) in args.iter().enumerate() {
         if arg == "--config" && args.get(place + 1).is_some() {
             config_path = &args[place + 1];
@@ -123,23 +56,27 @@ async fn main() -> Result<(), anyhow::Error> {
             is_pool = true;
         }
     }
+
     if full_dataset {
         randomx_use_full_mode();
+        Hash::new(b"INIT");
     }
 
+    // Create default config if it doesn't exist
     if !fs::exists(config_path).is_ok_and(|exists| exists == true) {
         File::create(config_path)?.write(DEFAULT_CONFIG.as_bytes())?;
         return Err(anyhow!(
-            "Created new config file: {}. Please replace <your public wallet address> in the config with your real miner address",
+            "Created new config file: {}. Please replace <your public wallet address> and <node address or pool address> in the config with your real miner address and pool / node address",
             config_path
         ));
     }
 
+    // Load configuration
     let settings = Config::builder()
         .add_source(config::File::with_name("miner.toml"))
         .build()?;
 
-    let node_address: String = settings.get("node.address")?;
+    let node_address: SocketAddr = settings.get::<String>("node.address")?.parse()?;
     let public_key_base36: String = settings.get("miner.public")?;
     let thread_count: i32 = settings.get("threads.count")?;
     let thread_count = if thread_count == -1 {
@@ -149,275 +86,211 @@ async fn main() -> Result<(), anyhow::Error> {
     };
 
     let miner_pub = Public::new_from_base36(&public_key_base36).expect("Invalid public key");
-    let submission_client = Arc::new(Client::connect(node_address.parse().unwrap()).await?);
-    let event_client = Client::connect(node_address.parse().unwrap()).await?;
-    let job_client = Arc::new(Client::connect(node_address.parse().unwrap()).await?);
 
+    // Create channels for block submissions and job distribution
+    let (job_tx, _) = broadcast::channel(64);
+    let (stat_tx, stat_rx) = mpsc::unbounded_channel();
+
+    let hash_counter = Arc::new(AtomicU64::new(0));
+    let global_job_id = Arc::new(AtomicU64::new(0));
+
+    // Start TUI
+    let tui_manager = TuiManager::new(thread_count as usize, is_pool);
+    tui_manager.start(stat_rx);
+
+    // Start miner with auto-reconnect
+    tokio::spawn(async move {
+        loop {
+            let result = run_miner(
+                node_address,
+                miner_pub,
+                thread_count,
+                is_pool,
+                job_tx.clone(),
+                hash_counter.clone(),
+                global_job_id.clone(),
+                stat_tx.clone(),
+            )
+            .await;
+
+            if let Err(e) = result {
+                stat_tx
+                    .send(StatEvent::Event(format!(
+                        "Connection lost: {}. Reconnecting in 5s...",
+                        e
+                    )))
+                    .ok();
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                stat_tx
+                    .send(StatEvent::Event("Attempting reconnection...".to_string()))
+                    .ok();
+            }
+        }
+    });
+
+    // Keep main thread alive
+    loop {
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    }
+}
+
+async fn run_miner(
+    node_address: SocketAddr,
+    miner_pub: Public,
+    thread_count: i32,
+    is_pool: bool,
+    job_tx: broadcast::Sender<snap_coin::core::block::Block>,
+    hash_counter: Arc<AtomicU64>,
+    global_job_id: Arc<AtomicU64>,
+    stat_tx: mpsc::UnboundedSender<StatEvent>,
+) -> Result<(), anyhow::Error> {
+    stat_tx
+        .send(StatEvent::Event(format!(
+            "Connecting to node at {}...",
+            node_address
+        )))
+        .ok();
+
+    // Connect to node with three separate clients
+    let submission_client = Arc::new(Client::connect(node_address).await?);
+    let event_client = Client::connect(node_address).await?;
+    let job_client = Arc::new(Client::connect(node_address).await?);
+
+    stat_tx
+        .send(StatEvent::Event("Connected successfully".to_string()))
+        .ok();
+
+    // Initialize pool connection if in pool mode
     let pool_info = if is_pool {
-        init_client_pool(&*submission_client, miner_pub).await?;
-        init_client_pool(&event_client, miner_pub).await?;
-        let pool_info = init_client_pool(&*job_client, miner_pub).await?;
-        println!(
-            "Pool INFO:\nDifficulty: {}",
-            normalize_difficulty(&pool_info.pool_difficulty)
-        );
-        Some(pool_info)
+        stat_tx
+            .send(StatEvent::Event(
+                "Initializing pool connection...".to_string(),
+            ))
+            .ok();
+        let info = pool::initialize_pool_connections(
+            &*submission_client,
+            &event_client,
+            &*job_client,
+            miner_pub,
+        )
+        .await?;
+        stat_tx
+            .send(StatEvent::Event(format!(
+                "Pool connected - Difficulty: {:.2}",
+                utils::normalize_difficulty(&info.pool_difficulty)
+            )))
+            .ok();
+        Some(info)
     } else {
         None
     };
 
-    // A task for block submissions, submitted via MPSC and a new block transmitted to all mining threads via a broadcast.
-    let (submission_tx, mut submission_rx) = mpsc::channel::<Block>(1);
+    // Create a new submission receiver for this connection
+    let (new_submission_tx, submission_rx) = mpsc::unbounded_channel();
 
-    let (job_tx, _) = broadcast::channel::<Block>(64);
-
-    let hash_counter = Arc::new(AtomicU64::new(0));
-
-    let global_job_id = Arc::new(AtomicU64::new(0));
-
-    // Create mining threads
-    for i in 0..thread_count {
-        println!("[THREAD {}] Starting miner", i + 1);
-        let mut job_rx = job_tx.subscribe();
-        let submission_tx = submission_tx.clone();
-        let hash_counter = hash_counter.clone();
-        let global_job_id = global_job_id.clone();
-        thread::spawn(move || {
-            let mut rng = rng();
-            let mut local_job_id = 0;
-            let mut current_block: Option<Block> = None;
-
-            loop {
-                if let Err(e) = (|| {
-                    // Check for new jobs and wait until we're synchronized
-                    let current_global_job = global_job_id.load(Ordering::Relaxed);
-
-                    // If we don't have a block yet or we're behind, wait for new job
-                    while current_block.is_none() || current_global_job > local_job_id {
-                        match job_rx.blocking_recv() {
-                            Ok(job) => {
-                                local_job_id += 1;
-                                current_block = Some(job);
-                                break;
-                            }
-                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                                println!(
-                                    "[THREAD {i}] Warning: Lagged by {skipped} jobs, catching up..."
-                                );
-                                continue;
-                            }
-                            Err(broadcast::error::RecvError::Closed) => {
-                                return Err(anyhow!("Job channel closed"));
-                            }
-                        }
-                    }
-
-                    // Only mine if we're synchronized with the global job ID
-                    if global_job_id.load(Ordering::Relaxed) != local_job_id {
-                        thread::sleep(Duration::from_millis(10));
-                        return Ok(());
-                    }
-
-                    let block = current_block.as_mut().unwrap();
-                    block.timestamp = chrono::Utc::now().timestamp() as u64;
-
-                    let mut removed_txs = false;
-                    // 10s expiration margin
-                    block.transactions.retain(|tx| {
-                        let expired = tx.timestamp + EXPIRATION_TIME + 10
-                            < chrono::Utc::now().timestamp() as u64;
-                        if expired {
-                            removed_txs = true;
-                        }
-                        !expired
-                    });
-
-                    if removed_txs {
-                        block.meta.merkle_tree_root = MerkleTree::build(
-                            &block
-                                .transactions
-                                .iter()
-                                .map(|tx| tx.transaction_id.unwrap())
-                                .collect::<Vec<TransactionId>>(),
-                        )
-                        .root_hash();
-                        block.meta.address_inclusion_filter =
-                            AddressInclusionFilter::create_filter(&block.transactions)?;
-                    }
-
-                    block.nonce = rng.random();
-                    block.meta.hash = Some(Hash::new(&block.get_hashing_buf()?));
-
-                    if is_pool {
-                        if BigUint::from_bytes_be(&pool_info.unwrap().pool_difficulty)
-                            > BigUint::from_bytes_be(&*block.meta.hash.unwrap())
-                            && global_job_id.load(Ordering::Relaxed) == local_job_id
-                        {
-                            println!(
-                                "[THREAD {i}] Found share {}",
-                                block.meta.hash.unwrap().dump_base36()
-                            );
-                            submission_tx.blocking_send(block.clone())?;
-                        }
-                    } else {
-                        if BigUint::from_bytes_be(&block.meta.block_pow_difficulty)
-                            > BigUint::from_bytes_be(&*block.meta.hash.unwrap())
-                            && global_job_id.load(Ordering::Relaxed) == local_job_id
-                        {
-                            println!(
-                                "[THREAD {i}] Found block {}",
-                                block.meta.hash.unwrap().dump_base36()
-                            );
-                            submission_tx.blocking_send(block.clone())?;
-                        }
-                    }
-
-                    hash_counter.fetch_add(1, Ordering::Relaxed);
-
-                    Ok::<(), anyhow::Error>(())
-                })() {
-                    println!("[THREAD {i}] Mining error: {e}")
-                }
-            }
-        });
+    // Start mining threads if not already started
+    let current_job_id = global_job_id.load(std::sync::atomic::Ordering::Relaxed);
+    let (shutdown_tx, _) = broadcast::channel::<()>(16);
+    if current_job_id == 0 {
+        for i in 0..thread_count {
+            stat_tx
+                .send(StatEvent::Event(format!("Starting thread {}", i + 1)))
+                .ok();
+            MiningThread::spawn(
+                i,
+                job_tx.subscribe(),
+                new_submission_tx.clone(),
+                hash_counter.clone(),
+                global_job_id.clone(),
+                pool_info,
+                is_pool,
+                stat_tx.clone(),
+                shutdown_tx.subscribe()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Give threads time to subscribe before starting job refresh
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Start stats monitor
+    let stats_monitor = MinerStats::new(hash_counter.clone(), stat_tx.clone());
+    stats_monitor.start();
 
-    let global_job_id_for_refresh = global_job_id.clone();
-    let _job_task = {
-        tokio::spawn(async move {
-            async fn get_current_mempool(
-                client: &Client,
-            ) -> Result<Vec<Transaction>, BlockchainDataProviderError> {
-                let mut mempool = slice_vec(
-                    &client.get_mempool().await?,
-                    0,
-                    MAX_TRANSACTIONS_PER_BLOCK - 1,
-                )
-                .to_vec();
-                mempool.retain(|tx| {
-                    tx.timestamp + 5 < EXPIRATION_TIME + chrono::Utc::now().timestamp() as u64
-                }); // Add a 5s anti expiration buffer
-                Ok(mempool)
-            }
+    // Start job manager
+    let job_manager = JobManager::new(
+        job_client,
+        job_tx.clone(),
+        global_job_id.clone(),
+        miner_pub,
+        is_pool,
+        stat_tx.clone(),
+    );
 
-            let is_refreshing = Arc::new(RwLock::new(false));
-            // We don't really care about what the event is because, it always requires recomputing the block
-            let refresh_block = move |event: Option<ChainEvent>| {
-                let client = job_client.clone();
-                let job_tx = job_tx.clone();
-                let is_refreshing: Arc<RwLock<bool>> = is_refreshing.clone();
-                let global_job_id = global_job_id_for_refresh.clone();
-                tokio::spawn(async move {
-                    if *is_refreshing.read().await {
-                        return;
-                    }
-
-                    *is_refreshing.write().await = true;
-                    if let Err(e) = async move {
-                        if is_pool {
-                            if let Some(event) = event
-                                && let ChainEvent::Block { block: job } = event
-                            {
-                                let new_job_id = global_job_id.fetch_add(1, Ordering::Relaxed) + 1;
-                                println!("[JOB] Received new job (ID: {new_job_id})");
-                                job_tx.send(job)?;
-                            }
-                            return Ok(());
-                        }
-
-                        let block =
-                            build_block(&*client, &get_current_mempool(&*client).await?, miner_pub)
-                                .await?;
-
-                        // Increment global job ID BEFORE sending the new job
-                        let new_job_id = global_job_id.fetch_add(1, Ordering::Relaxed) + 1;
-                        println!("[JOB] Received new job (ID: {new_job_id})");
-
-                        job_tx.send(block)?;
-
-                        Ok::<(), anyhow::Error>(())
-                    }
-                    .await
-                    {
-                        println!("[JOB] Error {e}");
-                        exit(1);
-                    }
-                    *is_refreshing.write().await = false;
-                });
-            };
-
-            // Initial block refresh
-            if !is_pool {
-                refresh_block(None)
-            };
-
-            if let Err(e) = event_client
-                .convert_to_event_listener(|event| {
-                    refresh_block(Some(event));
-                })
-                .await
-            {
-                println!("[JOB] Error: {:?}", e);
-                exit(2);
-            }
-        })
+    // Start submission handler and job manager
+    let res = tokio::select! {
+        res = handle_submissions(
+            submission_rx,
+            submission_client,
+            is_pool,
+            stat_tx.clone(),
+        ) => res,
+        res = job_manager.start(event_client) => res,
     };
-
-    let _hash_rate_task = tokio::spawn(async move {
-        loop {
-            if let Err(e) = async {
-                let last = chrono::Utc::now().timestamp_millis() as f64;
-                sleep(Duration::from_secs(3)).await;
-
-                let hashes = hash_counter.swap(0, Ordering::Relaxed) as f64;
-                let delta = chrono::Utc::now().timestamp_millis() as f64 - last;
-                let (display_rate, units) = format_hash_rate((hashes / delta) * 1000f64);
-                println!("[STATUS] Hash rate: {} {}", display_rate, units);
-                Ok::<(), anyhow::Error>(())
-            }
-            .await
-            {
-                println!("[STATUS] Error: {:?}", e);
-            }
-        }
-    });
-
-    let submission_task = tokio::spawn(async move {
-        loop {
-            if let Err(e) = async {
-                let candidate = submission_rx.recv().await;
-                if let Some(candidate) = candidate {
-                    // Don't increment global_job_id here - it's already incremented by refresh_block
-                    // which gets called when the block is accepted
-                    submission_client.submit_block(candidate).await??;
-                    if !is_pool {
-                        let block_reward = get_block_reward(
-                            submission_client.get_height().await?.saturating_sub(1),
-                        );
-                        println!(
-                            "[SUBMISSIONS] Block validated! Miner rewarded {} SNAP",
-                            to_snap(block_reward - calculate_dev_fee(block_reward))
-                        );
-                    } else {
-                        println!("[SUBMISSIONS] Share validated! Miner awarded share");
-                    }
-                } else {
-                    eprint!("[SUBMISSIONS] All miner threads died!");
-                }
-
-                Ok::<(), anyhow::Error>(())
-            }
-            .await
-            {
-                println!("[SUBMISSIONS] Error: {:?}", e);
-            }
-        }
-    });
-
-    submission_task.await?;
+    shutdown_tx.send(())?; // Shutdown all running miners
+    res?;
 
     Ok(())
+}
+
+async fn handle_submissions(
+    mut submission_rx: mpsc::UnboundedReceiver<snap_coin::core::block::Block>,
+    submission_client: Arc<Client>,
+    is_pool: bool,
+    stat_tx: mpsc::UnboundedSender<StatEvent>,
+) -> Result<(), anyhow::Error> {
+    loop {
+        if let Some(candidate) = submission_rx.recv().await {
+            match submission_client.submit_block(candidate).await {
+                Ok(Ok(_)) => {
+                    if !is_pool {
+                        if let Ok(height) = submission_client.get_height().await {
+                            let block_reward =
+                                snap_coin::economics::get_block_reward(height.saturating_sub(1));
+                            let net_reward = snap_coin::to_snap(
+                                block_reward
+                                    - snap_coin::economics::calculate_dev_fee(block_reward),
+                            );
+                            stat_tx
+                                .send(StatEvent::Event(format!(
+                                    "Block accepted! Reward: {} SNAP",
+                                    net_reward
+                                )))
+                                .ok();
+                            stat_tx.send(StatEvent::BlockAccepted).ok();
+                        }
+                    } else {
+                        stat_tx
+                            .send(StatEvent::Event("Share accepted".to_string()))
+                            .ok();
+                        stat_tx.send(StatEvent::ShareAccepted).ok();
+                    }
+                }
+                Ok(Err(e)) => {
+                    if !is_pool {
+                        stat_tx
+                            .send(StatEvent::Event(format!("Block rejected: {}", e)))
+                            .ok();
+                        stat_tx.send(StatEvent::BlockRejected).ok();
+                    } else {
+                        stat_tx
+                            .send(StatEvent::Event(format!("Share rejected: {}", e)))
+                            .ok();
+                        stat_tx.send(StatEvent::ShareRejected).ok();
+                    }
+                }
+                Err(e) => {
+                    return Err(e.into());
+                }
+            }
+        }
+    }
 }
