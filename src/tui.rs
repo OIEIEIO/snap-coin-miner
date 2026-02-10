@@ -1,3 +1,4 @@
+use chrono::Local;
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
@@ -14,7 +15,8 @@ use ratatui::{
 };
 use std::{
     collections::VecDeque,
-    io,
+    fs::{self, OpenOptions},
+    io::{self, Write},
     process::exit,
     sync::{Arc, Mutex},
     thread,
@@ -44,6 +46,9 @@ struct TuiState {
 
 impl TuiState {
     fn new(thread_count: usize, is_pool: bool) -> Self {
+        if fs::exists(".snap-coin-miner.log").unwrap() {
+            fs::remove_file(".snap-coin-miner.log").unwrap();
+        }
         Self {
             current_hashrate: 0.0,
             hashrate_history: VecDeque::with_capacity(GRAPH_POINTS),
@@ -156,6 +161,14 @@ impl TuiManager {
                         state.add_event(format!("New job received (ID: {})", job_id));
                     }
                     StatEvent::Event(msg) => {
+                        // Log to miner log
+                        let ts = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+                        let mut log = OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(".snap-coin-miner.log")
+                            .unwrap();
+                        writeln!(log, "[{}] {}", ts, msg).unwrap();
                         state.add_event(msg);
                     }
                 }

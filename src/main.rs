@@ -96,11 +96,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let miner_pub = Public::new_from_base36(&public_key_base36).expect("Invalid public key");
 
     // Create channels for block submissions and job distribution
-    let (job_tx, _) = broadcast::channel(64);
     let (stat_tx, stat_rx) = mpsc::unbounded_channel();
-
-    let hash_counter = Arc::new(AtomicU64::new(0));
-    let global_job_id = Arc::new(AtomicU64::new(0));
 
     // Start TUI
     let tui_manager = TuiManager::new(thread_count as usize, is_pool);
@@ -109,6 +105,12 @@ async fn main() -> Result<(), anyhow::Error> {
     // Start miner with auto-reconnect
     tokio::spawn(async move {
         loop {
+            let (shutdown_tx, _) = broadcast::channel::<()>(16);
+            let (job_tx, _) = broadcast::channel(64);
+
+            let hash_counter = Arc::new(AtomicU64::new(0));
+            let global_job_id = Arc::new(AtomicU64::new(0));
+
             let result = run_miner(
                 node_address,
                 miner_pub,
@@ -118,19 +120,24 @@ async fn main() -> Result<(), anyhow::Error> {
                 hash_counter.clone(),
                 global_job_id.clone(),
                 stat_tx.clone(),
+                shutdown_tx.clone(),
             )
             .await;
-
             if let Err(e) = result {
                 stat_tx
                     .send(StatEvent::Event(format!(
-                        "Connection lost: {}. Reconnecting in 5s...",
-                        e
+                        "Connection lost: {}. Reconnecting in 15s... ({} subscribers)",
+                        e,
+                        shutdown_tx.receiver_count()
                     )))
                     .ok();
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                shutdown_tx.send(()).ok();
+                tokio::time::sleep(Duration::from_secs(15)).await;
                 stat_tx
-                    .send(StatEvent::Event("Attempting reconnection...".to_string()))
+                    .send(StatEvent::Event(format!(
+                        "Attempting reconnection... (remaining {} subscribers)",
+                        shutdown_tx.receiver_count()
+                    )))
                     .ok();
             }
         }
@@ -151,6 +158,7 @@ async fn run_miner(
     hash_counter: Arc<AtomicU64>,
     global_job_id: Arc<AtomicU64>,
     stat_tx: mpsc::UnboundedSender<StatEvent>,
+    shutdown: broadcast::Sender<()>,
 ) -> Result<(), anyhow::Error> {
     stat_tx
         .send(StatEvent::Event(format!(
@@ -198,7 +206,6 @@ async fn run_miner(
 
     // Start mining threads if not already started
     let current_job_id = global_job_id.load(std::sync::atomic::Ordering::Relaxed);
-    let (shutdown_tx, _) = broadcast::channel::<()>(16);
     let cores = core_affinity::get_core_ids().unwrap();
     if current_job_id == 0 {
         for i in 0..thread_count {
@@ -214,7 +221,7 @@ async fn run_miner(
                 pool_info,
                 is_pool,
                 stat_tx.clone(),
-                shutdown_tx.subscribe(),
+                shutdown.subscribe(),
                 cores.get(i as usize).cloned(),
             );
         }
@@ -223,7 +230,7 @@ async fn run_miner(
 
     // Start stats monitor
     let stats_monitor = MinerStats::new(hash_counter.clone(), stat_tx.clone());
-    stats_monitor.start();
+    stats_monitor.start(shutdown.subscribe());
 
     // Start job manager
     let job_manager = JobManager::new(
@@ -233,20 +240,25 @@ async fn run_miner(
         miner_pub,
         is_pool,
         stat_tx.clone(),
+        shutdown.subscribe(),
     );
 
     // Start submission handler and job manager
-    let res = tokio::select! {
+    tokio::select! {
         res = handle_submissions(
             submission_rx,
             submission_client,
             is_pool,
             stat_tx.clone(),
-        ) => res,
-        res = job_manager.start(event_client) => res,
-    };
-    shutdown_tx.send(())?; // Shutdown all running miners
-    res?;
+        ) => {
+            stat_tx.send(StatEvent::Event("Submission manager died!".to_string())).ok();
+            res
+        },
+        res = job_manager.start(event_client) => {
+            stat_tx.send(StatEvent::Event("Job manager died!".to_string())).ok();
+            res
+        },
+    }?;
 
     Ok(())
 }

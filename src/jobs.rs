@@ -27,6 +27,7 @@ pub struct JobManager {
     miner_pub: Public,
     is_pool: bool,
     stat_tx: mpsc::UnboundedSender<StatEvent>,
+    shutdown_rx: broadcast::Receiver<()>,
 }
 
 impl JobManager {
@@ -37,6 +38,7 @@ impl JobManager {
         miner_pub: Public,
         is_pool: bool,
         stat_tx: mpsc::UnboundedSender<StatEvent>,
+        shutdown_rx: broadcast::Receiver<()>,
     ) -> Self {
         Self {
             job_client,
@@ -45,6 +47,7 @@ impl JobManager {
             miner_pub,
             is_pool,
             stat_tx,
+            shutdown_rx,
         }
     }
 
@@ -58,9 +61,12 @@ impl JobManager {
 
         // Listen for events and refresh on each one
         event_client
-            .convert_to_event_listener(|event| {
-                self.refresh_block(Some(event), is_refreshing.clone());
-            })
+            .convert_to_event_listener(
+                |event| {
+                    self.refresh_block(Some(event), is_refreshing.clone());
+                },
+                Some(self.shutdown_rx.resubscribe()),
+            )
             .await?;
 
         Ok(())

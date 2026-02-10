@@ -9,7 +9,7 @@ use snap_coin::{
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::Duration,
@@ -38,14 +38,27 @@ impl MiningThread {
             let mut local_job_id = 0;
             let mut current_block: Option<Block> = None;
             let mut thread_hashes = 0u64;
+            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let shutdown_flag_clone = shutdown_flag.clone();
+
             core_affinity::set_for_current(cpu_core.expect("No core affinity found!"));
 
+            let stat_tx_clone = stat_tx.clone();
+            thread::spawn(move || {
+                let _ = shutdown.blocking_recv();
+                stat_tx_clone
+                    .send(StatEvent::Event(format!("Requested thread shutdown {thread_id}")))
+                    .ok();
+                shutdown_flag_clone.store(true, Ordering::Relaxed);
+            });
+
             loop {
-                if shutdown.try_recv().is_ok() {
+                // Fast shutdown check - just atomic load, no syscalls
+                if shutdown_flag.load(Ordering::Relaxed) {
                     break;
                 }
 
-                if let Err(e) = Self::mine_iteration(
+                if let Err(_) = Self::mine_iteration(
                     thread_id,
                     &mut job_rx,
                     &submission_tx,
@@ -57,14 +70,9 @@ impl MiningThread {
                     is_pool,
                     &stat_tx,
                     &mut thread_hashes,
+                    &shutdown_flag,
                 ) {
-                    stat_tx
-                        .send(StatEvent::Event(format!(
-                            "Thread {} error: {}",
-                            thread_id + 1,
-                            e
-                        )))
-                        .ok();
+                    break;
                 }
             }
         });
@@ -82,19 +90,27 @@ impl MiningThread {
         is_pool: bool,
         stat_tx: &mpsc::UnboundedSender<StatEvent>,
         thread_hashes: &mut u64,
+        shutdown_flag: &Arc<AtomicBool>,
     ) -> Result<(), anyhow::Error> {
         let current_global_job = global_job_id.load(Ordering::Relaxed);
 
         // Wait for a new job if we don't have one or are behind
         while current_block.is_none() || current_global_job > *local_job_id {
-            match job_rx.blocking_recv() {
+            if shutdown_flag.load(Ordering::Relaxed) {
+                return Err(anyhow!("Requested thread shutdown {thread_id}"));
+            }
+
+            match job_rx.try_recv() {
                 Ok(job) => {
                     *local_job_id += 1;
                     *current_block = Some(job);
                     current_block.as_mut().unwrap().nonce = random();
                     break;
                 }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
                     stat_tx
                         .send(StatEvent::Event(format!(
                             "Thread {} lagged by {} jobs",
@@ -102,9 +118,8 @@ impl MiningThread {
                             skipped
                         )))
                         .ok();
-                    continue;
                 }
-                Err(broadcast::error::RecvError::Closed) => {
+                Err(broadcast::error::TryRecvError::Closed) => {
                     return Err(anyhow!("Job channel closed"));
                 }
             }
@@ -172,7 +187,6 @@ impl MiningThread {
                         block.meta.hash.unwrap().dump_base36()
                     )))
                     .ok();
-                // FIXED: Non-blocking send with unbounded channel
                 submission_tx
                     .send(block.clone())
                     .map_err(|e| anyhow!("Failed to send submission: {}", e))?;
@@ -188,7 +202,6 @@ impl MiningThread {
                         block.meta.hash.unwrap().dump_base36()
                     )))
                     .ok();
-                // FIXED: Non-blocking send with unbounded channel
                 submission_tx
                     .send(block.clone())
                     .map_err(|e| anyhow!("Failed to send submission: {}", e))?;

@@ -1,3 +1,4 @@
 /target
 Cargo.lock
 miner.toml
+.snap-coin-miner.log

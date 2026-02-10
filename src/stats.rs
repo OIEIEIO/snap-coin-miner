@@ -5,7 +5,10 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{sync::mpsc, time::sleep};
+use tokio::{
+    sync::{broadcast, mpsc},
+    time::sleep,
+};
 
 #[derive(Debug, Clone)]
 pub enum StatEvent {
@@ -25,21 +28,23 @@ pub struct MinerStats {
 }
 
 impl MinerStats {
-    pub fn new(
-        hash_counter: Arc<AtomicU64>,
-        stat_tx: mpsc::UnboundedSender<StatEvent>,
-    ) -> Self {
+    pub fn new(hash_counter: Arc<AtomicU64>, stat_tx: mpsc::UnboundedSender<StatEvent>) -> Self {
         Self {
             hash_counter,
             stat_tx,
         }
     }
 
-    pub fn start(self) {
+    pub fn start(self, mut shutdown: broadcast::Receiver<()>) {
         tokio::spawn(async move {
             loop {
+                if let Ok(()) = shutdown.try_recv() {
+                    break;
+                }
                 if let Err(e) = self.measure_hash_rate().await {
-                    self.stat_tx.send(StatEvent::Event(format!("Stats error: {}", e))).ok();
+                    self.stat_tx
+                        .send(StatEvent::Event(format!("Stats error: {}", e)))
+                        .ok();
                 }
             }
         });
@@ -52,9 +57,9 @@ impl MinerStats {
         let hashes = self.hash_counter.swap(0, Ordering::Relaxed) as f64;
         let delta = chrono::Utc::now().timestamp_millis() as f64 - last;
         let hash_rate = (hashes / delta) * 1000.0;
-        
+
         self.stat_tx.send(StatEvent::HashRate(hash_rate)).ok();
-        
+
         Ok(())
     }
 }
