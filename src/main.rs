@@ -3,13 +3,13 @@ use config::Config;
 use snap_coin::{
     api::client::Client,
     blockchain_data_provider::BlockchainDataProvider,
-    crypto::{Hash, keys::Public, randomx_use_full_mode},
+    crypto::{Hash, keys::Public, randomx_optimized_mode},
 };
 use std::{
     env::args,
     fs::{self, File},
     io::Write,
-    net::SocketAddr,
+    net::{SocketAddr, ToSocketAddrs},
     sync::{Arc, atomic::AtomicU64},
     thread,
     time::Duration,
@@ -42,6 +42,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut config_path = "./miner.toml";
     let args: Vec<String> = args().into_iter().collect();
     let mut full_dataset = true;
+    let mut huge_pages = true;
     let mut is_pool = false;
 
     // Parse command line arguments
@@ -52,13 +53,16 @@ async fn main() -> Result<(), anyhow::Error> {
         if arg == "--no-dataset" {
             full_dataset = false;
         }
+        if arg == "--no-huge-pages" {
+            huge_pages = false;
+        }
         if arg == "--pool" {
             is_pool = true;
         }
     }
 
     if full_dataset {
-        randomx_use_full_mode();
+        randomx_optimized_mode(huge_pages);
         Hash::new(b"INIT");
     }
 
@@ -76,7 +80,11 @@ async fn main() -> Result<(), anyhow::Error> {
         .add_source(config::File::with_name("miner.toml"))
         .build()?;
 
-    let node_address: SocketAddr = settings.get::<String>("node.address")?.parse()?;
+    let node_address: SocketAddr = settings
+        .get::<String>("node.address")?
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "No address found"))?;
     let public_key_base36: String = settings.get("miner.public")?;
     let thread_count: i32 = settings.get("threads.count")?;
     let thread_count = if thread_count == -1 {
@@ -191,6 +199,7 @@ async fn run_miner(
     // Start mining threads if not already started
     let current_job_id = global_job_id.load(std::sync::atomic::Ordering::Relaxed);
     let (shutdown_tx, _) = broadcast::channel::<()>(16);
+    let cores = core_affinity::get_core_ids().unwrap();
     if current_job_id == 0 {
         for i in 0..thread_count {
             stat_tx
@@ -205,7 +214,8 @@ async fn run_miner(
                 pool_info,
                 is_pool,
                 stat_tx.clone(),
-                shutdown_tx.subscribe()
+                shutdown_tx.subscribe(),
+                cores.get(i as usize).cloned(),
             );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

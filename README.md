@@ -22,7 +22,10 @@ Specifies path to a `toml` miner config.
 Starts the miner in pool mode.
 
 3. `--no-dataset`
-starts the miner without initializing the full RandomX scratchpad, highly unrecommended.
+Starts the miner without initializing the full RandomX scratchpad, highly unrecommended.
+
+4. `--no-full-pages`
+Starts the miner without utilizing full pages. Use this if your system crashes without it.
 
 ## Configuration
 The miner configuration is stored in a toml file that is structured like this:
@@ -36,3 +39,11 @@ public = "<your public wallet address>"
 [threads]
 count = <amount of threads to run on, -1 for max>
 ```
+
+## Huge pages
+The miner support huge pages (a big optimization), however you must enable it for your OS. On linux run:
+```bash
+sudo sysctl -w vm.nr_hugepages=2048
+```
+*(this command does not persist during system reboots)*
+to enable them. If your system does not support full pages, pass in `--no-full-pages`.

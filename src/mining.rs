@@ -1,6 +1,6 @@
 use anyhow::anyhow;
-use num_bigint::BigUint;
-use rand::{Rng, rng};
+use core_affinity::CoreId;
+use rand::random;
 use snap_coin::{
     core::{block::Block, transaction::TransactionId},
     crypto::{Hash, address_inclusion_filter::AddressInclusionFilter, merkle_tree::MerkleTree},
@@ -32,12 +32,13 @@ impl MiningThread {
         is_pool: bool,
         stat_tx: mpsc::UnboundedSender<StatEvent>,
         mut shutdown: broadcast::Receiver<()>,
+        cpu_core: Option<CoreId>,
     ) {
         thread::spawn(move || {
-            let mut rng = rng();
             let mut local_job_id = 0;
             let mut current_block: Option<Block> = None;
             let mut thread_hashes = 0u64;
+            core_affinity::set_for_current(cpu_core.expect("No core affinity found!"));
 
             loop {
                 if shutdown.try_recv().is_ok() {
@@ -50,7 +51,6 @@ impl MiningThread {
                     &submission_tx,
                     &hash_counter,
                     &global_job_id,
-                    &mut rng,
                     &mut local_job_id,
                     &mut current_block,
                     pool_info,
@@ -70,14 +70,12 @@ impl MiningThread {
         });
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn mine_iteration(
         thread_id: i32,
         job_rx: &mut broadcast::Receiver<Block>,
         submission_tx: &mpsc::UnboundedSender<Block>,
         hash_counter: &Arc<AtomicU64>,
         global_job_id: &Arc<AtomicU64>,
-        rng: &mut impl Rng,
         local_job_id: &mut u64,
         current_block: &mut Option<Block>,
         pool_info: Option<PoolInfo>,
@@ -93,6 +91,7 @@ impl MiningThread {
                 Ok(job) => {
                     *local_job_id += 1;
                     *current_block = Some(job);
+                    current_block.as_mut().unwrap().nonce = random();
                     break;
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -146,7 +145,7 @@ impl MiningThread {
         }
 
         // Try a new nonce and hash the block
-        block.nonce = rng.random();
+        block.nonce += 1;
         block.meta.hash = Some(Hash::new(&block.get_hashing_buf()?));
 
         // Increment hash counter and thread-specific counter
@@ -163,8 +162,7 @@ impl MiningThread {
 
         // Check if the hash meets the difficulty target
         if is_pool {
-            if BigUint::from_bytes_be(&pool_info.unwrap().pool_difficulty)
-                > BigUint::from_bytes_be(&*block.meta.hash.unwrap())
+            if pool_info.unwrap().pool_difficulty > *block.meta.hash.unwrap()
                 && global_job_id.load(Ordering::Relaxed) == *local_job_id
             {
                 stat_tx
@@ -180,8 +178,7 @@ impl MiningThread {
                     .map_err(|e| anyhow!("Failed to send submission: {}", e))?;
             }
         } else {
-            if BigUint::from_bytes_be(&block.meta.block_pow_difficulty)
-                > BigUint::from_bytes_be(&*block.meta.hash.unwrap())
+            if block.meta.block_pow_difficulty > *block.meta.hash.unwrap()
                 && global_job_id.load(Ordering::Relaxed) == *local_job_id
             {
                 stat_tx
