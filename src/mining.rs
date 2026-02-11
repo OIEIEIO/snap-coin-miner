@@ -2,7 +2,7 @@ use anyhow::anyhow;
 use core_affinity::CoreId;
 use rand::random;
 use snap_coin::{
-    core::{block::Block, transaction::TransactionId},
+    core::{block::Block, difficulty::calculate_block_difficulty, transaction::TransactionId},
     crypto::{Hash, address_inclusion_filter::AddressInclusionFilter, merkle_tree::MerkleTree},
     economics::EXPIRATION_TIME,
 };
@@ -47,7 +47,9 @@ impl MiningThread {
             thread::spawn(move || {
                 let _ = shutdown.blocking_recv();
                 stat_tx_clone
-                    .send(StatEvent::Event(format!("Requested thread shutdown {thread_id}")))
+                    .send(StatEvent::Event(format!(
+                        "Requested thread shutdown {thread_id}"
+                    )))
                     .ok();
                 shutdown_flag_clone.store(true, Ordering::Relaxed);
             });
@@ -192,7 +194,10 @@ impl MiningThread {
                     .map_err(|e| anyhow!("Failed to send submission: {}", e))?;
             }
         } else {
-            if block.meta.block_pow_difficulty > *block.meta.hash.unwrap()
+            if calculate_block_difficulty(
+                &block.meta.block_pow_difficulty,
+                block.transactions.len(),
+            ) > *block.meta.hash.unwrap()
                 && global_job_id.load(Ordering::Relaxed) == *local_job_id
             {
                 stat_tx
